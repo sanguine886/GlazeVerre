@@ -211,7 +211,7 @@ enum ShellCommandParser {
                         index += 1
                         continue
                     }
-                    if inner == "`" || (inner == "$" && index + 1 < characters.count, characters[index + 1] == "(") {
+                    if inner == "`" || (inner == "$" && index + 1 < characters.count && characters[index + 1] == "(") {
                         parsed.unsafeSyntax = true
                     }
                     current.append(inner)
