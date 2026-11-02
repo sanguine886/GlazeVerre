@@ -17,9 +17,6 @@ struct ServerDetailView: View {
     @State private var errorMessage: String?
     @State private var isCollecting = false
 
-    /// History cap per metric (keeps the sparkline bounded).
-    private let historyLimit = 60
-
     var body: some View {
         ScrollView {
             VStack(spacing: GlassSpacing.md) {
@@ -151,8 +148,9 @@ struct ServerDetailView: View {
     // MARK: - Collection loop
 
     private func openAndCollect() async {
-        guard session == nil else { return }
-        guard !isCollecting else { return }
+        // Show the last known state immediately; the live loop extends it.
+        metrics = ServerMetricsCache.shared.history(for: record.id)
+        guard session == nil, !isCollecting else { return }
         let (freshSession, config): (SSHSession, SSHHostConfig)
         do {
             (freshSession, config) = try manager.openSession(for: record)
@@ -185,17 +183,19 @@ struct ServerDetailView: View {
             return
         }
 
-        var sampler = ServerMetricSampler(session: freshSession)
-        do {
-            while isCollecting {
-                if let snap = try? await sampler.sample() {
-                    metrics.append(snap)
-                    if metrics.count > historyLimit {
-                        metrics.removeFirst(metrics.count - historyLimit)
-                    }
-                }
-                try? await Task.sleep(for: .seconds(3))
+        await collect(on: freshSession)
+    }
+
+    /// The 3-second sampling loop, shared by the direct path and the
+    /// trust-the-fingerprint path (which used to flip the live indicator on
+    /// without ever sampling).
+    private func collect(on session: SSHSession) async {
+        var sampler = ServerMetricSampler(session: session)
+        while isCollecting {
+            if let snap = try? await sampler.sample() {
+                metrics = ServerMetricsCache.shared.append(snap, for: record.id)
             }
+            try? await Task.sleep(for: .seconds(3))
         }
     }
 
@@ -218,6 +218,7 @@ struct ServerDetailView: View {
                 session = flow.session
                 pendingFlow = nil
                 isCollecting = true
+                await collect(on: flow.session)
             } catch {
                 pendingFlow = nil
                 errorMessage = error.localizedDescription

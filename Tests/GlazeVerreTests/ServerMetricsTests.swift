@@ -26,6 +26,30 @@ final class ServerMetricsTests: XCTestCase {
         XCTAssertEqual(result.tx, 0)
     }
 
+    func testEthBytesPrefersRealInterfaceOverLoopback() {
+        let dev = """
+        lo: 999 1 0 0 0 0 0 0 999 1 0 0 0 0 0 0
+        eth0: 1000000 200 300 400 0 0 0 0 500000 100 0 0 0 0 0 0
+        """
+        let result = ServerMetricSampler.ethBytes(in: dev)
+        XCTAssertEqual(result.rx, 1_000_000, "loopback traffic is not the network metric")
+        XCTAssertEqual(result.tx, 500_000)
+    }
+
+    func testEthBytesFallsBackToLoopbackWhenItIsTheOnlyDevice() {
+        let dev = "lo: 999 1 0 0 0 0 0 0 777 1 0 0 0 0 0 0"
+        let result = ServerMetricSampler.ethBytes(in: dev)
+        XCTAssertEqual(result.rx, 999)
+        XCTAssertEqual(result.tx, 777)
+    }
+
+    func testRateIsZeroWhenCountersGoBackwards() {
+        // A reboot or `ifdown` resets the counter; UInt64 subtraction would trap.
+        XCTAssertEqual(ServerMetricSampler.rate(from: 1_000_000, to: 10, elapsed: 3), 0)
+        XCTAssertEqual(ServerMetricSampler.rate(from: 100, to: 400, elapsed: 3), 100)
+        XCTAssertEqual(ServerMetricSampler.rate(from: 100, to: 400, elapsed: 0), 0)
+    }
+
     func testFirstNumberAfterMarker() {
         XCTAssertEqual(ServerMetricSampler.firstNumber(after: "load avg:", in: "load avg: 1.25 0.75 0.5"), 1.25)
         XCTAssertNil(ServerMetricSampler.firstNumber(after: "nonexistent", in: "anything"))

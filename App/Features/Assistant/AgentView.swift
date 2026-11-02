@@ -7,10 +7,13 @@ import SwiftUI
 /// surfaces approval cards with edit-after-approval, a floating kill switch,
 /// and links to the audit trail.
 struct AgentView: View {
+    /// Shared with the chat transcript (same SSH pool + kill switch), owned by
+    /// `AssistantView`.
+    let runner: AgentRunner
+
     @Environment(AIProviderManager.self) private var providers
     @Environment(HostManager.self) private var hostManager
     @Environment(AuditManager.self) private var audit
-    @State private var runner = AgentRunner()
     @State private var prompt = ""
     @State private var selectedHostID: UUID?
     @State private var strategy = ApprovalStrategy.alwaysAsk

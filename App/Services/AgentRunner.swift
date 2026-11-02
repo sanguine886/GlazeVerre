@@ -44,7 +44,10 @@ final class AgentRunner {
     /// Optional Sendable audit sink bound from the view.
     private var auditSink: (any AuditLogging)?
 
-    private var host: SSHSession?
+    /// Live sessions by host id. A tool may target any configured server
+    /// (真机需求: 助手需能在某个服务器上执行命令), and consecutive turns reuse
+    /// the connection instead of re-handshaking per command.
+    private var sessions: [UUID: SSHSession] = [:]
 
     /// Bound from the view's environment audit manager.
     func setAudit(_ audit: (any AuditLogging)?) {
@@ -64,25 +67,12 @@ final class AgentRunner {
         self.hostRecord = hostRecord
         self.hostManager = hostManager
 
-        // Build the real host session.
-        var session: SSHSession
-        var config: SSHHostConfig
-        do {
-            let opened = try hostManager.openSession(for: hostRecord)
-            session = opened.0
-            config = opened.1
-        } catch {
-            return error.localizedDescription
+        // Open (or reuse) the default target so the first tool call does not pay
+        // for the handshake, and so an unreachable host fails loudly up front.
+        let resolved = await resolveSession(alias: nil)
+        guard let session = resolved.session else {
+            return resolved.error
         }
-        host = session
-
-        // Confirm connectivity (throws on failure).
-        do {
-            try await session.connect(config: config, knownHosts: hostManager.knownHosts)
-        } catch {
-            return error.localizedDescription
-        }
-        hostManager.markConnected(hostRecord)
 
         // Build the provider adapter from the stored key.
         guard let apiKey = try? KeychainStore().load(account: provider.apiKeyRef), !apiKey.isEmpty else {
@@ -94,7 +84,10 @@ final class AgentRunner {
         // may actually propose. Tools without an executor are not broadcast, so the
         // model never proposes something that would end in unknownToolCall.
         var registry = AgentToolRegistry(definitions: [])
-        let sshExecutor = SSHCommandExecutor(session: session)
+        let sshExecutor = SSHCommandExecutor(resolve: { [weak self] alias in
+            guard let self else { return (nil, "agent runner released") }
+            return await resolveSession(alias: alias)
+        })
         for definition in AgentToolRegistry.defaultToolDefinitions
             where !Self.isAppManagedTool(definition.name)
         {
@@ -118,9 +111,11 @@ final class AgentRunner {
         isRunning = true
         phaseLabel = "agent.thinking"
 
+        // Only aliases go to the model: hostnames/IPs stay local (spec §6.4.2).
         let context = AgentContext(
             userPrompt: prompt,
-            host: HostSummary(alias: hostRecord.name, workingPaths: [])
+            host: HostSummary(alias: hostRecord.name, workingPaths: []),
+            availableHosts: hostManager.allHosts.map(\.name)
         )
         do {
             let turn = try await loop.requestTurn(prompt: prompt, context: context)
@@ -135,6 +130,36 @@ final class AgentRunner {
         }
     }
 
+    /// Resolves a tool's optional `host` alias to a connected session, opening one
+    /// on demand. Returns a message instead of a session when it cannot connect,
+    /// so the model learns why rather than seeing an empty result.
+    func resolveSession(alias: String?) async -> (session: SSHSession?, error: String?) {
+        guard let hostManager else {
+            return (nil, String(localized: "agent.noHost"))
+        }
+        let record: HostRecord? = if let alias, !alias.isEmpty {
+            hostManager.allHosts.first { $0.name.caseInsensitiveCompare(alias) == .orderedSame }
+        } else {
+            hostRecord ?? hostManager.allHosts.first
+        }
+        guard let record else {
+            return (nil, "unknown server '\(alias ?? "")'")
+        }
+
+        let session = sessions[record.id] ?? SSHSession()
+        do {
+            let config = try hostManager.openSession(for: record).1
+            // `connect` is a no-op while already connected and reconnects a
+            // dropped transport, so this doubles as the liveness check.
+            try await session.connect(config: config, knownHosts: hostManager.knownHosts)
+            hostManager.markConnected(record)
+            sessions[record.id] = session
+            return (session, nil)
+        } catch {
+            return (nil, "\(record.name): \(error.localizedDescription)")
+        }
+    }
+
     /// Runs the next model turn after the user decided on a proposal.
     func proceed(approve: Bool, editedCommand: String?) async -> String? {
         guard let loop, let proposal = pendingProposal else { return nil }
@@ -142,9 +167,13 @@ final class AgentRunner {
         // returned by an edit re-approval (dangerous edit) can be reassigned by
         // surface() instead of being cleared by a late defer.
         pendingProposal = nil
+        let edit = (editedCommand?.isEmpty ?? true) ? nil : editedCommand
+        if approve {
+            echoLines.append("$ " + (edit ?? proposal.commandText ?? proposal.toolName))
+        }
         do {
             let turn: AgentTurn = if approve {
-                try await loop.continueAfterApproval(proposal: proposal, editedCommand: editedCommand)
+                try await loop.continueAfterApproval(proposal: proposal, editedCommand: edit)
             } else {
                 try await loop.continueAfterRejection(proposal: proposal)
             }
@@ -153,17 +182,20 @@ final class AgentRunner {
         } catch {
             isRunning = false
             phaseLabel = "agent.failed"
+            echoLines.append("⚠️ " + error.localizedDescription)
             return error.localizedDescription
         }
     }
 
-    /// Kill switch: aborts in-flight work (spec §4.6). Disconnects the host so any
-    /// running exec channel is aborted; the session's reconnect policy restores
-    /// it before the next run.
+    /// Kill switch: aborts in-flight work (spec §4.6). Disconnects every pooled
+    /// host so any running exec channel is aborted; the next run reconnects.
     func kill() async {
         await loop?.cancel()
-        await host?.disconnect()
-        host = nil
+        let stale = Array(sessions.values)
+        sessions = [:]
+        for session in stale {
+            await session.disconnect()
+        }
         isRunning = false
         phaseLabel = "agent.idle"
     }
@@ -193,12 +225,24 @@ final class AgentRunner {
     }
 }
 
-/// A real executor that runs commands over the SSH session.
+/// A real executor that runs the approved command over SSH, on whichever server
+/// the tool named (`host` argument) or the session's default.
 private struct SSHCommandExecutor: AgentToolExecutor, Sendable {
-    let session: SSHSession
+    /// Hops to the runner (MainActor) to resolve and connect the target host.
+    let resolve: @Sendable (String?) async -> (session: SSHSession?, error: String?)
 
     func execute(_ invocation: AgentToolInvocation, cancelToken: AgentCancellationToken?) async throws -> ToolResult {
+        let resolved = await resolve(invocation.arguments["host"]?.stringValue)
+        guard let session = resolved.session else {
+            let message = resolved.error ?? "no server available"
+            return ToolResult(toolCallID: invocation.toolCallID, text: message, status: .failure(message), truncated: false)
+        }
+        // AgentLoop renders every tool into the shell command the human approved.
         let command = invocation.arguments["command"]?.stringValue ?? ""
+        guard !command.isEmpty else {
+            let message = "\(invocation.name) produced no command to run"
+            return ToolResult(toolCallID: invocation.toolCallID, text: message, status: .failure(message), truncated: false)
+        }
         // Kill switch must actually abort the in-flight exec. SSHSession exposes
         // no per-exec cancel, so we disconnect the transport (which aborts the
         // exec channel); the reconnect policy restores it before the next turn.

@@ -23,8 +23,10 @@ import Foundation
         private let stdin: ShellStdin
         private var outputTask: Task<Void, Never>?
         private let fontName: String
-        private let fontSize: Int
         private let theme: TerminalTheme
+
+        /// Live font size (pinch-to-zoom on the phone changes it).
+        public private(set) var currentFontSize: Int
 
         public init(
             shell: ShellStreams,
@@ -34,7 +36,7 @@ import Foundation
         ) {
             stdin = shell.stdin
             self.fontName = fontName
-            self.fontSize = fontSize
+            currentFontSize = fontSize
             self.theme = theme
 
             // Scrollback >= 10000 lines (spec §4.3).
@@ -79,13 +81,27 @@ import Foundation
             Task { try? await stdin.write(Data(text.utf8)) }
         }
 
+        /// Sets the terminal font size, clamped to a readable range. Changing it
+        /// reflows the emulator, which reports a new column count and resizes the
+        /// remote PTY — this is pinch-to-zoom on the phone.
+        public func setFontSize(_ size: Int) {
+            let clamped = min(max(size, 8), 28)
+            guard clamped != currentFontSize else { return }
+            currentFontSize = clamped
+            terminalView.font = font(ofSize: clamped)
+        }
+
         private func applyStyle() {
             terminalView.nativeBackgroundColor = uiColor(theme.background)
             terminalView.nativeForegroundColor = uiColor(theme.foreground)
             terminalView.caretColor = uiColor(theme.cursor)
-            terminalView.font = UIFont(name: fontName, size: CGFloat(fontSize))
-                ?? UIFont.monospacedSystemFont(ofSize: CGFloat(fontSize), weight: .regular)
+            terminalView.font = font(ofSize: currentFontSize)
             terminalView.installColors(theme.ansi.map(swiftColor))
+        }
+
+        private func font(ofSize size: Int) -> UIFont {
+            UIFont(name: fontName, size: CGFloat(size))
+                ?? UIFont.monospacedSystemFont(ofSize: CGFloat(size), weight: .regular)
         }
 
         private func uiColor(_ rgba: TerminalRGBA) -> UIColor {

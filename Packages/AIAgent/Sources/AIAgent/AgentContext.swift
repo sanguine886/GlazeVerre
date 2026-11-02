@@ -27,11 +27,20 @@ public struct AgentContext: Sendable, Equatable {
     /// Last N lines of the terminal scrollback, when the agent is attached to
     /// a live session (empty when not).
     public let recentOutput: [String]
+    /// Aliases of every server the operator configured, so the model can name a
+    /// target instead of the app silently picking one (真机需求: 助手需识别服务器列表).
+    public let availableHosts: [String]
 
-    public init(userPrompt: String, host: HostSummary, recentOutput: [String] = []) {
+    public init(
+        userPrompt: String,
+        host: HostSummary,
+        recentOutput: [String] = [],
+        availableHosts: [String] = []
+    ) {
         self.userPrompt = userPrompt
         self.host = host
         self.recentOutput = recentOutput
+        self.availableHosts = availableHosts
     }
 }
 
@@ -47,11 +56,21 @@ public enum AgentContextBuilder {
         var lines = [
             "You are GlazeVerre's remote-ops agent on host '\(context.host.alias)'.",
             "You may only PROPOSE actions; a human approves every execution.",
+            "Every tool runs as a shell command over SSH on a Linux host, so use real",
+            "shell commands (`run_command` with e.g. `uptime`, `df -h`) — tool names are",
+            "not commands the host knows.",
+            "Answer from your own knowledge and do NOT call a tool when the question",
+            "does not need the server.",
             "Prefer read-only, idempotent operations. When running a command is unsafe,",
             "leave safe_to_run=false so the human can review.",
-            "",
-            "Approved working directories:",
         ]
+        if !context.availableHosts.isEmpty {
+            lines.append("")
+            lines.append("Servers the operator configured (pass `host` to target one, default '\(context.host.alias)'):")
+            lines.append(contentsOf: context.availableHosts.map { "- \($0)" })
+        }
+        lines.append("")
+        lines.append("Approved working directories:")
         for path in context.host.workingPaths {
             lines.append("- \(path)")
         }

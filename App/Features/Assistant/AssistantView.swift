@@ -1,5 +1,6 @@
 import AIAgent
 import GlassKit
+import Persistence
 import SwiftUI
 
 /// AI assistant chat (spec §4.5): multi-session transcript, streaming turns,
@@ -8,10 +9,7 @@ struct AssistantView: View {
     @Environment(AIProviderManager.self) private var providers
     @Environment(HostManager.self) private var hostManager
     @Environment(ChatManager.self) private var chat
-    /// The host the AI operates on (chat context + agent target). Defaults to
-    /// the first configured server; user selects via the toolbar (真机验收:
-    /// 对话需能读取/操作已添加服务器).
-    @State private var targetHostID: UUID?
+    @Environment(AuditManager.self) private var audit
 
     enum Mode: String, CaseIterable, Identifiable {
         case chat
@@ -25,7 +23,8 @@ struct AssistantView: View {
     @State private var draft = ""
     @State private var showPreview = false
     @FocusState private var inputFocused: Bool
-    /// Agent engine shared by chat (when a host is selected) and the agent tab.
+    /// Agent engine shared by chat and the agent tab: one SSH session pool, one
+    /// kill switch, one audit sink.
     @State private var agentRunner = AgentRunner()
     @State private var agentEditedCommand = ""
 
@@ -44,7 +43,7 @@ struct AssistantView: View {
                     if mode == .chat {
                         content
                     } else {
-                        AgentView()
+                        AgentView(runner: agentRunner)
                     }
                 }
             }
@@ -53,6 +52,8 @@ struct AssistantView: View {
             .background(Color.glassBackground.ignoresSafeArea())
             .accessibilityIdentifier("screen.assistant.heading")
             .task {
+                hostManager.refresh()
+                agentRunner.setAudit(audit.loggingSink())
                 agentRunner.onAgentAnswer = { [chat] text in
                     Task { @MainActor in
                         chat.appendAgentText(text)
@@ -66,52 +67,27 @@ struct AssistantView: View {
                     }
                 }
                 ToolbarItemGroup(placement: .topBarTrailing) {
-                    hostMenu
+                    Label(targetHostTitle, systemImage: "server.rack")
+                        .font(.caption)
+                        .foregroundStyle(Color.glassSecondaryText)
                 }
             }
         }
     }
 
-    /// Target-host picker for the AI. Lets the assistant read/operate a
-    /// configured server: the chosen host's summary feeds the system prompt so
-    /// the model knows which machine it is acting on.
-    private var hostMenu: some View {
-        Menu {
-            Button("assistant.host.none", systemImage: "link.slash") {
-                targetHostID = nil
-            }
-            ForEach(hostManager.allHosts) { host in
-                Button {
-                    targetHostID = host.id
-                } label: {
-                    Text("\(host.name) (\(host.username)@\(host.hostname))")
-                }
-            }
-        } label: {
-            Label(targetHostTitle, systemImage: "server.rack")
-        }
+    /// The server the assistant acts on by default. No picker on purpose: the
+    /// model sees every configured server in its context and names the one it
+    /// wants (真机需求: 对话界面不需要切换主机).
+    private var defaultHost: HostRecord? {
+        hostManager.allHosts.first
     }
 
     private var targetHostTitle: String {
-        guard let id = targetHostID,
-              let host = hostManager.allHosts.first(where: { $0.id == id })
-        else {
+        guard let host = defaultHost else {
             return String(localized: "assistant.host.none")
         }
-        return host.name
-    }
-
-    /// The host context to attach to this turn (server the AI operates on).
-    private var attachedContext: AgentContext? {
-        guard let id = targetHostID,
-              let host = hostManager.allHosts.first(where: { $0.id == id })
-        else {
-            return nil
-        }
-        return AgentContext(
-            userPrompt: "",
-            host: HostSummary(alias: host.name, workingPaths: [])
-        )
+        let extras = hostManager.allHosts.count - 1
+        return extras > 0 ? "\(host.name) +\(extras)" : host.name
     }
 
     private var sessionMenu: some View {
@@ -178,8 +154,11 @@ struct AssistantView: View {
                                 isDangerous: proposal.classification.verdict != .safe
                             ),
                             onApprove: {
+                                // Read the edit BEFORE clearing it, or the user's
+                                // edited command is thrown away.
+                                let edited = agentEditedCommand
                                 agentEditedCommand = ""
-                                Task { _ = await agentRunner.proceed(approve: true, editedCommand: agentEditedCommand) }
+                                Task { _ = await agentRunner.proceed(approve: true, editedCommand: edited) }
                             },
                             onReject: {
                                 Task { _ = await agentRunner.proceed(approve: false, editedCommand: nil) }
@@ -188,6 +167,17 @@ struct AssistantView: View {
                         TextField("agent.editCommand", text: $agentEditedCommand)
                             .font(.system(.caption, design: .monospaced))
                             .textFieldStyle(.roundedBorder)
+                    }
+                    // What the agent is doing on the server right now, so the
+                    // transcript shows the operation and not just the answer.
+                    if agentRunner.isRunning, !agentRunner.echoLines.isEmpty {
+                        ForEach(agentRunner.echoLines.suffix(4), id: \.self) { line in
+                            Text(line)
+                                .font(.system(.caption, design: .monospaced))
+                                .foregroundStyle(Color.glassSecondaryText)
+                                .lineLimit(3)
+                                .textSelection(.enabled)
+                        }
                     }
                     if chat.isStreaming {
                         HStack {
@@ -285,15 +275,15 @@ struct AssistantView: View {
 
     private func send() {
         let prompt = draft.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !prompt.isEmpty else { return }
-        guard let config = providers.activeProviderConfig else { return }
+        guard !prompt.isEmpty, let config = providers.activeProviderConfig else { return }
         draft = ""
         Task {
             _ = await chat.send(
                 prompt,
                 provider: config,
-                hostContext: attachedContext,
-                agentRunner: attachedContext == nil ? nil : agentRunner
+                agentHost: defaultHost,
+                hostManager: defaultHost == nil ? nil : hostManager,
+                agentRunner: defaultHost == nil ? nil : agentRunner
             )
         }
     }

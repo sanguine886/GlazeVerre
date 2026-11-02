@@ -45,8 +45,14 @@ public actor SSHSession {
     private var validator: TOFUHostKeyValidator?
     private var knownHosts: KnownHostsStore?
     private var keepaliveTask: Task<Void, Never>?
+    private var reconnectTask: Task<Void, Never>?
     private var stateContinuations: [UUID: AsyncStream<SSHSessionState>.Continuation] = [:]
     private var userClosed = false
+    /// Identifies the current connection lifecycle. Every connect/disconnect
+    /// bumps it, so a handshake, reconnect or drop callback that belongs to an
+    /// older lifecycle is ignored instead of resurrecting a dead session
+    /// (ADR-0011).
+    private var generation: UInt64 = 0
 
     public init(
         transportMaker: any SSHTransportMaking = CitadelTransportFactory(),
@@ -83,14 +89,20 @@ public actor SSHSession {
         )
         self.validator = validator
 
+        generation &+= 1
+        let attempt = generation
         setState(.connecting)
         do {
-            try await openTransport(config: config, validator: validator)
+            try await openTransport(config: config, validator: validator, attempt: attempt)
             setState(.connected)
             startKeepalive()
         } catch {
             let mapped = Self.mapHostKeyError(error, validator: validator, knownHosts: knownHosts, config: config)
-            setState(.failed(mapped))
+            // A disconnect during the handshake already published `.closed`;
+            // do not overwrite it with a failure the user never caused.
+            if attempt == generation {
+                setState(.failed(mapped))
+            }
             throw mapped
         }
     }
@@ -124,8 +136,13 @@ public actor SSHSession {
     /// User-initiated close: no reconnects afterwards.
     public func disconnect() async {
         userClosed = true
+        // Bump the generation so a handshake or reconnect that is still in
+        // flight cannot install a transport after the user closed the session.
+        generation &+= 1
         keepaliveTask?.cancel()
         keepaliveTask = nil
+        reconnectTask?.cancel()
+        reconnectTask = nil
         if let transport {
             await transport.close()
         }
@@ -141,10 +158,19 @@ public actor SSHSession {
         transport
     }
 
-    private func openTransport(config: SSHHostConfig, validator: TOFUHostKeyValidator) async throws {
+    /// Opens a fresh transport for `attempt` and installs it as the live one.
+    ///
+    /// The transport's drop callback carries the generation it was opened
+    /// under, so a drop from a superseded connection cannot trigger a
+    /// reconnect on the current one.
+    private func openTransport(
+        config: SSHHostConfig,
+        validator: TOFUHostKeyValidator,
+        attempt: UInt64
+    ) async throws {
         var fresh = transportMaker.makeTransport()
         fresh.onDrop = { [weak self] in
-            Task { await self?.handleUnexpectedDrop() }
+            Task { await self?.handleUnexpectedDrop(attempt: attempt) }
         }
         do {
             try await fresh.open(config: config, validator: validator)
@@ -152,20 +178,30 @@ public actor SSHSession {
             await fresh.close()
             throw error
         }
+        // The handshake may have completed after the user disconnected or
+        // after a newer connect took over; such a transport is stale and must
+        // be closed instead of installed.
+        guard attempt == generation, !userClosed else {
+            await fresh.close()
+            throw SSHError.cancelled
+        }
         if let old = transport {
             await old.close()
         }
         transport = fresh
     }
 
-    private func handleUnexpectedDrop() {
-        guard !userClosed, case .connected = state else { return }
+    private func handleUnexpectedDrop(attempt: UInt64) {
+        guard attempt == generation, !userClosed, case .connected = state else { return }
         keepaliveTask?.cancel()
         setState(.reconnecting(attempt: 0))
-        Task { await reconnectLoop() }
+        reconnectTask = Task { [weak self] in
+            guard let self else { return }
+            await reconnectLoop(attempt: attempt)
+        }
     }
 
-    private func reconnectLoop() async {
+    private func reconnectLoop(attempt: UInt64) async {
         guard let config, let validator else { return }
 
         var failures = 0
@@ -175,21 +211,26 @@ public actor SSHSession {
                 jitterSeconds: Double.random(in: 0 ... 0.25)
             )
             try? await Task.sleep(for: .seconds(delay))
-            if userClosed {
+            if userClosed || attempt != generation {
                 return
             }
 
             setState(.reconnecting(attempt: failures + 1))
             do {
-                try await openTransport(config: config, validator: validator)
+                try await openTransport(config: config, validator: validator, attempt: attempt)
                 setState(.connected)
                 startKeepalive()
                 return
             } catch {
+                if userClosed || attempt != generation {
+                    return
+                }
                 failures += 1
             }
         }
-        setState(.failed(.connectionLost))
+        if attempt == generation, !userClosed {
+            setState(.failed(.connectionLost))
+        }
     }
 
     private func startKeepalive() {
@@ -207,11 +248,12 @@ public actor SSHSession {
 
     private func sendKeepalive() {
         guard case .connected = state, let transport else { return }
+        let attempt = generation
         Task {
             do {
                 _ = try await transport.run("true")
             } catch {
-                handleUnexpectedDrop()
+                handleUnexpectedDrop(attempt: attempt)
             }
         }
     }

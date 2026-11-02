@@ -91,6 +91,7 @@ public struct AgentToolRegistry: Sendable {
                         description: "The shell command to execute."
                     ),
                     "timeout_s": propertySchema(type: "integer", description: "Timeout in seconds."),
+                    "host": hostProperty(),
                     "safe_to_run": safeToRunProperty(),
                 ]),
                 "required": .array([.string("command")]),
@@ -104,6 +105,7 @@ public struct AgentToolRegistry: Sendable {
                 "type": .string("object"),
                 "properties": .object([
                     "path": propertySchema(type: "string", description: "Absolute path of the file to read."),
+                    "host": hostProperty(),
                     "safe_to_run": safeToRunProperty(),
                 ]),
                 "required": .array([.string("path")]),
@@ -118,6 +120,7 @@ public struct AgentToolRegistry: Sendable {
                 "properties": .object([
                     "path": propertySchema(type: "string", description: "Absolute path of the file to write."),
                     "content": propertySchema(type: "string", description: "Full content to write."),
+                    "host": hostProperty(),
                     "safe_to_run": safeToRunProperty(),
                 ]),
                 "required": .array([.string("path"), .string("content")]),
@@ -131,6 +134,7 @@ public struct AgentToolRegistry: Sendable {
                 "type": .string("object"),
                 "properties": .object([
                     "path": propertySchema(type: "string", description: "Absolute path of the directory to list."),
+                    "host": hostProperty(),
                     "safe_to_run": safeToRunProperty(),
                 ]),
                 "required": .array([.string("path")]),
@@ -139,10 +143,12 @@ public struct AgentToolRegistry: Sendable {
         ),
         ToolDefinition(
             name: "get_system_info",
-            description: "Return basic information about the connected host.",
+            description: "Return basic information about the connected host "
+                + "(runs uname/uptime/free/df over SSH).",
             parameters: .object([
                 "type": .string("object"),
                 "properties": .object([
+                    "host": hostProperty(),
                     "safe_to_run": safeToRunProperty(),
                 ]),
                 "required": .array([]),
@@ -189,6 +195,44 @@ public struct AgentToolRegistry: Sendable {
         executors[name]
     }
 
+    /// Renders a tool invocation into the shell command that actually runs on the
+    /// host. The model proposes abstract tools (`read_file`, `get_system_info`),
+    /// but a Linux box only speaks shell — one renderer keeps the approval card,
+    /// the dangerous-command classifier and the executor looking at the very same
+    /// text, so what a human approves is what runs.
+    ///
+    /// Returns nil for app-managed tools (snippets) that never touch the shell.
+    /// `write_file` passes its payload as DATA (`printf '%s' '<content>'`),
+    /// never as shell source: a heredoc would let a payload that contains the
+    /// delimiter line run as commands, and `printf` with a quoted argument
+    /// keeps the bytes exactly as the model wrote them.
+    public static func shellCommand(for name: String, arguments: [String: JSONValue]) -> String? {
+        let path = arguments["path"]?.stringValue
+        switch name {
+        case "run_command":
+            return arguments["command"]?.stringValue
+        case "read_file":
+            return path.map { "cat -- \(singleQuoted($0))" }
+        case "list_dir":
+            return path.map { "ls -la -- \(singleQuoted($0))" }
+        case "write_file":
+            guard let path, let content = arguments["content"]?.stringValue else {
+                return nil
+            }
+            return "printf '%s' \(singleQuoted(content)) > \(singleQuoted(path))"
+        case "get_system_info":
+            return "uname -a; uptime; free -h; df -h /"
+        default:
+            return nil
+        }
+    }
+
+    /// POSIX single-quoting, so a path can never break out of the command it is
+    /// embedded in (`it's` → `'it'\''s'`).
+    static func singleQuoted(_ value: String) -> String {
+        "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
+    }
+
     private static func propertySchema(type: String, description: String) -> JSONValue {
         .object([
             "type": .string(type),
@@ -205,5 +249,15 @@ public struct AgentToolRegistry: Sendable {
                     + "user can review it."
             ),
         ])
+    }
+
+    /// Optional target-server alias. The operator may have several servers
+    /// configured; naming one here routes the tool to that host instead of the
+    /// session's default (spec §4.6 host context).
+    private static func hostProperty() -> JSONValue {
+        propertySchema(
+            type: "string",
+            description: "Optional server alias to run this on. Omit to use the current host."
+        )
     }
 }

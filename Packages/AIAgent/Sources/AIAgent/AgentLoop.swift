@@ -78,6 +78,7 @@ public final class AgentLoop {
     public func requestTurn(prompt: String, context: AgentContext) async throws -> AgentTurn {
         phase = .thinking
         history = []
+        roundCount = 0
         let system = AgentContextBuilder.systemPrompt(tools: registry.definitions, context: context, approvedWorkingDir: context.host.workingPaths.first)
         history.append(ChatMessage(role: .system, content: system))
         history.append(ChatMessage(role: .user, content: prompt))
@@ -163,6 +164,14 @@ public final class AgentLoop {
             throw AgentError.cancelled
         }
 
+        // The round budget is a hard stop: without it a model that keeps
+        // proposing tools loops until the provider bills out.
+        if roundCount > configuration.maxToolRounds {
+            let message = "Stopped after \(configuration.maxToolRounds) tool rounds."
+            phase = .finished(text: message)
+            return AgentTurn(text: message, proposal: nil)
+        }
+
         let request = ChatCompletionRequest(model: configuration.model, messages: history, tools: registry.definitions)
         let stream = try await provider.streamCompletion(request)
         var textPieces: [String] = []
@@ -194,27 +203,27 @@ public final class AgentLoop {
         phase = .thinking
 
         if let call = toolCall, !call.name.isEmpty {
+            // The assistant turn that issued the tool call MUST be in the history
+            // before its `tool` result is sent back, or the provider rejects the
+            // next request with "tool result's tool id (…) not found".
+            history.append(ChatMessage(role: .assistant, content: text, toolCalls: [call]))
             let proposal = try await makeProposal(from: call, text: text)
             phase = .awaitingApproval(proposal)
             return AgentTurn(text: text, proposal: proposal)
         }
 
         let answer = text.isEmpty ? "(no response)" : text
+        history.append(ChatMessage(role: .assistant, content: answer))
         phase = .finished(text: answer)
         return AgentTurn(text: answer, proposal: nil)
     }
 
     private func makeProposal(from call: AssistantToolCall, text: String) async throws -> AgentProposal {
         let arguments = Self.parseArguments(call.argumentsJSON ?? "{}")
-        let commandText: String? = if case let .string(cmd) = arguments["command"] {
-            cmd
-        } else if case let .string(p) = arguments["path"] {
-            p
-        } else if case .object = arguments["arguments"] {
-            nil
-        } else {
-            nil
-        }
+        // What will actually run on the host — the shell rendering of this tool.
+        // The card shows it, the classifier judges it and the executor runs it.
+        let commandText = AgentToolRegistry.shellCommand(for: call.name, arguments: arguments)
+            ?? arguments["path"]?.stringValue
         let safe = arguments["safe_to_run"] == .boolean(true)
         let classification = DangerousCommandClassifier().classify(commandText ?? "")
         return AgentProposal(
@@ -260,9 +269,12 @@ public final class AgentLoop {
         let invocation = AgentToolInvocation(
             toolCallID: proposal.toolCallID,
             name: proposal.toolName,
-            arguments: proposal.arguments
+            arguments: Self.merging(command: command, into: proposal.arguments)
         )
-        let result = try await executor.execute(invocation, cancelToken: cancelToken())
+        let executed = try await executor.execute(invocation, cancelToken: cancelToken())
+        // Spec §4.6: a single tool result is clamped before it goes back to the
+        // model, so one `cat` of a big log cannot blow up the context.
+        let result = Self.clamped(executed, limitBytes: configuration.outputLimitBytes)
         let outcome: AuditEntry.Outcome = editApproved ? .editedApproved : .userApproved
         await auditLog.record(AuditEntry(
             timestamp: Date(),
@@ -274,6 +286,30 @@ public final class AgentLoop {
             outcome: outcome
         ))
         return result
+    }
+
+    /// Hands the executor the command that was actually approved. Without this an
+    /// edited command would be discarded and the model's original one would run.
+    private static func merging(command: String?, into arguments: [String: JSONValue]) -> [String: JSONValue] {
+        guard let command, !command.isEmpty else {
+            return arguments
+        }
+        var merged = arguments
+        merged["command"] = .string(command)
+        return merged
+    }
+
+    private static func clamped(_ result: ToolResult, limitBytes: Int) -> ToolResult {
+        let (text, truncated) = ToolResult.clampOutput(result.text, limitBytes: limitBytes)
+        guard truncated else {
+            return result
+        }
+        return ToolResult(
+            toolCallID: result.toolCallID,
+            text: text + "\n… output truncated at \(limitBytes) bytes",
+            status: result.status,
+            truncated: true
+        )
     }
 
     private static func isReadonlyTool(_ name: String, registry: AgentToolRegistry) -> Bool {

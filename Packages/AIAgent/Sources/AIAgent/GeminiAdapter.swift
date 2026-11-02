@@ -336,8 +336,9 @@ public struct GeminiAdapter: AIChatStreaming {
     }
 
     static func serializeJSON(_ value: Any) -> String? {
-        guard JSONSerialization.isValidJSONObject(value) else { return nil }
-        guard let data = try? JSONSerialization.data(withJSONObject: value, options: [.withoutEscapingSlashes]) else { return nil }
+        guard JSONSerialization.isValidJSONObject(value),
+              let data = try? JSONSerialization.data(withJSONObject: value, options: [.withoutEscapingSlashes])
+        else { return nil }
         return String(data: data, encoding: .utf8)
     }
 

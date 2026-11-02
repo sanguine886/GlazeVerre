@@ -12,14 +12,17 @@ actor FakeChatProvider: AIChatStreaming {
 
     private var script: [Response]
     private(set) var requests = 0
+    /// The last request the loop sent, so tests can assert on the message chain.
+    private(set) var lastRequest: ChatCompletionRequest?
 
     init(_ script: [Response]) {
         self.script = script
     }
 
     func streamCompletion(
-        _: ChatCompletionRequest
+        _ request: ChatCompletionRequest
     ) async throws -> AsyncThrowingStream<ChatStreamEvent, Error> {
+        lastRequest = request
         let script = script
         let index = requests
         let response = script[min(index, script.count - 1)]
@@ -34,6 +37,20 @@ actor FakeChatProvider: AIChatStreaming {
             continuation.yield(.done)
             continuation.finish()
         }
+    }
+}
+
+/// Records what it was asked to run, so tests can assert the approved command
+/// (not the model's original) reaches the host.
+final class CapturingToolExecutor: AgentToolExecutor, @unchecked Sendable {
+    private(set) var commands: [String] = []
+
+    func execute(
+        _ invocation: AgentToolInvocation,
+        cancelToken _: AgentCancellationToken?
+    ) async throws -> ToolResult {
+        commands.append(invocation.arguments["command"]?.stringValue ?? "")
+        return ToolResult(toolCallID: invocation.toolCallID, text: "captured", status: .success, truncated: false)
     }
 }
 
@@ -98,19 +115,19 @@ final class AgentLoopTests: XCTestCase {
         script: [FakeChatProvider.Response],
         host: FakeHostSession = FakeHostSession(),
         strategy: ApprovalStrategy = .alwaysAsk,
-        toolName _: String = "run_command",
-        toolArguments _: [String: JSONValue] = ["command": .string("ls -la /tmp"), "safe_to_run": .boolean(false)]
+        executor: any AgentToolExecutor = FakeToolExecutor(output: "fake output"),
+        outputLimitBytes: Int = 8 * 1024
     ) -> Fixture {
         let provider = FakeChatProvider(script)
         var registry = AgentToolRegistry(definitions: AgentToolRegistry.defaultToolDefinitions)
         // Register a fake executor for run_command so the loop can execute it.
         registry.register(
             ToolDefinition(name: "run_command", description: "run a command", parameters: JSONSchemaBuilder.object(properties: [:]), isReadonly: false),
-            executor: FakeToolExecutor(output: "fake output")
+            executor: executor
         )
         let decider = ApprovalDecider()
         let audit = InMemoryAuditLog()
-        let config = AgentLoopConfiguration(model: "test-model", strategy: strategy)
+        let config = AgentLoopConfiguration(model: "test-model", strategy: strategy, outputLimitBytes: outputLimitBytes)
         let loop = AgentLoop(
             provider: provider,
             host: host,
@@ -241,5 +258,103 @@ final class AgentLoopTests: XCTestCase {
             let runs = await host.runs
             XCTAssertTrue(runs.isEmpty, "no strategy may run a critical command")
         }
+    }
+
+    /// Regression: the provider rejected the follow-up request with
+    /// "tool result's tool id (…) not found" because the assistant turn that
+    /// issued the tool call was missing from the history.
+    @MainActor
+    func testToolResultIsPrecededByItsAssistantToolCall() async throws {
+        let call = AssistantToolCall(id: "chatcmpl-tool-9d84", name: "run_command", argumentsJSON: #"{"command":"uptime","safe_to_run":true}"#)
+        let fixture = makeLoop(
+            script: [
+                .init(text: "checking", toolCall: call),
+                .init(text: "all good", toolCall: nil),
+            ]
+        )
+        let first = try await fixture.loop.requestTurn(
+            prompt: "status",
+            context: AgentContext(userPrompt: "status", host: HostSummary(alias: "h", workingPaths: []))
+        )
+        guard let proposal = first.proposal else {
+            return XCTFail("expected proposal")
+        }
+        _ = try await fixture.loop.continueAfterApproval(proposal: proposal, editedCommand: nil)
+
+        let messages = await fixture.provider.lastRequest?.messages ?? []
+        guard let toolIndex = messages.firstIndex(where: { $0.role == .tool }) else {
+            return XCTFail("tool result must be sent back to the model")
+        }
+        let assistantCalls = messages[..<toolIndex].filter { $0.role == .assistant }.flatMap(\.toolCalls)
+        XCTAssertTrue(
+            assistantCalls.contains { $0.id == messages[toolIndex].toolCallID },
+            "the assistant tool_call must precede its tool result, or the provider returns HTTP 400"
+        )
+    }
+
+    /// The command the human approved is the command that runs — an edit used to
+    /// be re-classified and then silently dropped on the way to the executor.
+    @MainActor
+    func testApprovedEditRunsInsteadOfTheModelsCommand() async throws {
+        let call = AssistantToolCall(id: "7", name: "run_command", argumentsJSON: #"{"command":"uptime","safe_to_run":true}"#)
+        let executor = CapturingToolExecutor()
+        let fixture = makeLoop(
+            script: [
+                .init(text: "checking", toolCall: call),
+                .init(text: "done", toolCall: nil),
+            ],
+            executor: executor
+        )
+        let first = try await fixture.loop.requestTurn(
+            prompt: "uptime",
+            context: AgentContext(userPrompt: "uptime", host: HostSummary(alias: "h", workingPaths: []))
+        )
+        guard let proposal = first.proposal else {
+            return XCTFail("expected proposal")
+        }
+        _ = try await fixture.loop.continueAfterApproval(proposal: proposal, editedCommand: "uptime -p")
+        XCTAssertEqual(executor.commands, ["uptime -p"])
+    }
+
+    /// A tool without a `command` argument (`get_system_info`) must still reach
+    /// the host as a real shell command — Linux has no `get_system_info`.
+    @MainActor
+    func testAbstractToolIsRenderedIntoAShellCommand() async throws {
+        let call = AssistantToolCall(id: "8", name: "run_command", argumentsJSON: #"{"safe_to_run":true}"#)
+        let fixture = makeLoop(script: [.init(text: "info", toolCall: call)])
+        let turn = try await fixture.loop.requestTurn(
+            prompt: "info",
+            context: AgentContext(userPrompt: "info", host: HostSummary(alias: "h", workingPaths: []))
+        )
+        XCTAssertNil(turn.proposal?.commandText, "run_command without a command has nothing to run")
+
+        let rendered = AgentToolRegistry.shellCommand(for: "get_system_info", arguments: ["safe_to_run": .boolean(true)])
+        XCTAssertEqual(rendered, "uname -a; uptime; free -h; df -h /")
+    }
+
+    @MainActor
+    func testToolOutputIsClampedBeforeItGoesBackToTheModel() async throws {
+        let call = AssistantToolCall(id: "9", name: "run_command", argumentsJSON: #"{"command":"cat big.log","safe_to_run":true}"#)
+        let fixture = makeLoop(
+            script: [
+                .init(text: "reading", toolCall: call),
+                .init(text: "done", toolCall: nil),
+            ],
+            executor: FakeToolExecutor(output: String(repeating: "x", count: 40)),
+            outputLimitBytes: 8
+        )
+        let first = try await fixture.loop.requestTurn(
+            prompt: "log",
+            context: AgentContext(userPrompt: "log", host: HostSummary(alias: "h", workingPaths: []))
+        )
+        guard let proposal = first.proposal else {
+            return XCTFail("expected proposal")
+        }
+        _ = try await fixture.loop.continueAfterApproval(proposal: proposal, editedCommand: nil)
+        let messages = await fixture.provider.lastRequest?.messages ?? []
+        let content = messages.first { $0.role == .tool }?.content ?? ""
+        XCTAssertTrue(content.hasPrefix("xxxxxxxx"), "the first 8 bytes survive")
+        XCTAssertFalse(content.hasPrefix(String(repeating: "x", count: 9)), "everything past the limit is dropped")
+        XCTAssertTrue(content.contains("truncated"), "the model is told the output was cut")
     }
 }

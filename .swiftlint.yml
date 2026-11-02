@@ -3,6 +3,8 @@ excluded:
   - .build
   - build
   - DerivedData
+  # SPM writes one .build per package; the bare `.build` above only matches the repo root.
+  - Packages/*/.build
 
 line_length:
   warning: 120

@@ -31,7 +31,6 @@ struct TerminalScreenView: View {
             if let terminalSession {
                 TerminalViewWrapper(session: terminalSession)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    .ignoresSafeArea(.keyboard)
             } else {
                 openingState
             }
@@ -165,7 +164,10 @@ struct TerminalScreenView: View {
     }
 
     private func attachShell(_ session: SSHSession) async throws {
-        let shell = try await session.requestShell(cols: 40, rows: 16)
+        // A conventional 80x24 PTY; SwiftTerm reports the real column count for
+        // the phone on its first layout pass and TerminalSession forwards it as a
+        // window-change, so the remote reflows to the actual screen width.
+        let shell = try await session.requestShell(cols: 80, rows: 24)
         let terminal = TerminalSession(
             shell: shell,
             fontName: prefs.fontName,
@@ -225,54 +227,91 @@ private struct TerminalViewWrapper: UIViewRepresentable {
     let session: TerminalSession
 
     func makeUIView(context _: Context) -> UIView {
-        // A host view that fills the phone and, on every layout, resizes the
-        // SwiftTerm terminal to the actual column/row count for its bounds.
-        // This is what keeps the CLI from overflowing the screen (真机验收:
-        // 终端宽度>屏幕). Auto Layout alone does not resize the emulator.
         let host = TerminalHostView()
         host.backgroundColor = .black
-        host.attach(session.terminalView)
+        host.attach(session)
         return host
     }
 
     func updateUIView(_ container: UIView, context _: Context) {
         guard let host = container as? TerminalHostView else { return }
-        host.attach(session.terminalView)
-        host.setNeedsLayout()
+        host.attach(session)
+    }
+
+    /// Take exactly the size SwiftUI proposes. Without this the representable is
+    /// measured through Auto Layout, and SwiftTerm's intrinsic content width
+    /// (columns × cell width) makes the CLI wider than the phone (真机验收:
+    /// 终端宽度大于屏幕).
+    func sizeThatFits(_ proposal: ProposedViewSize, uiView _: UIView, context _: Context) -> CGSize? {
+        guard let width = proposal.width, let height = proposal.height else {
+            return nil
+        }
+        return CGSize(width: width, height: height)
     }
 }
 
-/// Host UIView that owns a SwiftTerm terminal and re-sizes it to fit its own
-/// bounds. `layoutSubviews` runs on every size change (rotation, split, launch).
+/// Host UIView that owns a SwiftTerm terminal, keeps it exactly its own size,
+/// takes keyboard focus, and pinch-zooms the font.
 ///
-/// SwiftTerm's own `TerminalView.layoutSubviews` re-flows the emulator to the
-/// view width (column count = width / cell width), so the host only needs to pin
-/// the terminal to its bounds and force a layout pass on size changes.
+/// Frame-based layout on purpose: Auto Layout would let the terminal's intrinsic
+/// content size propagate outwards and overflow the screen.
 private final class TerminalHostView: UIView {
-    private var terminalView: TerminalView?
+    private var session: TerminalSession?
+    private var terminalView: TerminalView? {
+        session?.terminalView
+    }
 
-    func attach(_ terminal: TerminalView) {
-        if terminalView === terminal {
+    func attach(_ session: TerminalSession) {
+        if self.session === session {
             return
         }
-        terminalView?.removeFromSuperview()
-        terminal.translatesAutoresizingMaskIntoConstraints = false
+        self.session?.terminalView.removeFromSuperview()
+        self.session = session
+        let terminal = session.terminalView
+        terminal.translatesAutoresizingMaskIntoConstraints = true
+        terminal.frame = bounds
         addSubview(terminal)
-        NSLayoutConstraint.activate([
-            terminal.topAnchor.constraint(equalTo: topAnchor),
-            terminal.leadingAnchor.constraint(equalTo: leadingAnchor),
-            terminal.trailingAnchor.constraint(equalTo: trailingAnchor),
-            terminal.bottomAnchor.constraint(equalTo: bottomAnchor),
-        ])
-        terminalView = terminal
+        installGestures(on: terminal)
         setNeedsLayout()
+        _ = terminal.becomeFirstResponder()
     }
 
     override func layoutSubviews() {
         super.layoutSubviews()
-        // The pinned terminal fills our bounds; force its own layout so
-        // SwiftTerm recalculates columns to the phone width. No manual resize
-        // needed — internal cell metrics aren't public API.
-        terminalView?.setNeedsLayout()
+        // SwiftTerm recomputes its columns/rows from this frame and reports the
+        // new size through TerminalViewDelegate → the remote PTY is resized.
+        terminalView?.frame = bounds
+    }
+
+    override func didMoveToWindow() {
+        super.didMoveToWindow()
+        if window != nil {
+            _ = terminalView?.becomeFirstResponder()
+        }
+    }
+
+    private func installGestures(on terminal: TerminalView) {
+        let focus = UITapGestureRecognizer(target: self, action: #selector(handleFocusTap))
+        focus.cancelsTouchesInView = false
+        terminal.addGestureRecognizer(focus)
+
+        let pinch = UIPinchGestureRecognizer(target: self, action: #selector(handlePinch))
+        terminal.addGestureRecognizer(pinch)
+    }
+
+    /// Raises the keyboard for the terminal — without a first responder nothing
+    /// typed reaches the shell (真机验收: 键盘无法输入到 CLI).
+    @objc private func handleFocusTap() {
+        _ = terminalView?.becomeFirstResponder()
+    }
+
+    /// Pinch to change the font size (the terminal reflows, so this is how you
+    /// fit more columns on a phone).
+    @objc private func handlePinch(_ gesture: UIPinchGestureRecognizer) {
+        guard gesture.state == .changed, let session else { return }
+        let step = gesture.scale > 1.08 ? 1 : (gesture.scale < 0.92 ? -1 : 0)
+        guard step != 0 else { return }
+        session.setFontSize(session.currentFontSize + step)
+        gesture.scale = 1
     }
 }

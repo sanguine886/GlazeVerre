@@ -24,10 +24,21 @@ final class HostManager {
     private let secrets: SecretStoring
     let knownHosts: KnownHostsStore
 
+    /// The host list, kept as stored state so `@Observable` actually notifies
+    /// views. A computed `try? hostStore.all()` registers no dependency, which is
+    /// why tab2/tab3 used to miss servers added in tab1 until an app restart.
+    private(set) var hosts: [HostRecord] = []
+
     init(hostStore: HostStore, secrets: SecretStoring, knownHosts: KnownHostsStore) {
         self.hostStore = hostStore
         self.secrets = secrets
         self.knownHosts = knownHosts
+        refresh()
+    }
+
+    /// Re-reads the host list from the store and notifies observers.
+    func refresh() {
+        hosts = (try? hostStore.all()) ?? []
     }
 
     /// Creates or updates a host, (re)storing its secret in the Keychain.
@@ -68,6 +79,7 @@ final class HostManager {
         } else {
             try hostStore.update(record)
         }
+        refresh()
         return record
     }
 
@@ -79,6 +91,7 @@ final class HostManager {
             try? secrets.delete(account: ref)
         }
         try hostStore.delete(id: record.id)
+        refresh()
     }
 
     func record(id: UUID) -> HostRecord? {
@@ -87,11 +100,12 @@ final class HostManager {
 
     /// All hosts, for pickers (snippet runner).
     var allHosts: [HostRecord] {
-        (try? hostStore.all()) ?? []
+        hosts
     }
 
     func markConnected(_ record: HostRecord) {
         try? hostStore.markConnected(id: record.id)
+        refresh()
     }
 
     /// Builds a session plus its config, resolving secrets from the Keychain

@@ -88,4 +88,90 @@ final class AgentToolRegistryTests: XCTestCase {
         XCTAssertEqual(invocation.name, "run_command")
         XCTAssertEqual(invocation.arguments["command"], .string("ls /home"))
     }
+
+    // MARK: - Shell rendering (abstract tool → real command)
+
+    func testShellCommandRendersEveryHostTool() {
+        let path: [String: JSONValue] = ["path": .string("/etc/hosts")]
+        XCTAssertEqual(AgentToolRegistry.shellCommand(for: "run_command", arguments: ["command": .string("df -h")]), "df -h")
+        XCTAssertEqual(AgentToolRegistry.shellCommand(for: "read_file", arguments: path), "cat -- '/etc/hosts'")
+        XCTAssertEqual(AgentToolRegistry.shellCommand(for: "list_dir", arguments: ["path": .string("/var/log")]), "ls -la -- '/var/log'")
+        XCTAssertEqual(
+            AgentToolRegistry.shellCommand(for: "get_system_info", arguments: [:]),
+            "uname -a; uptime; free -h; df -h /"
+        )
+    }
+
+    func testShellCommandWriteFilePreservesContent() {
+        let rendered = AgentToolRegistry.shellCommand(
+            for: "write_file",
+            arguments: ["path": .string("/tmp/a.txt"), "content": .string("line1\nline2")]
+        )
+        XCTAssertEqual(rendered, "printf '%s' 'line1\nline2' > '/tmp/a.txt'")
+        XCTAssertNil(
+            AgentToolRegistry.shellCommand(for: "write_file", arguments: ["path": .string("/tmp/a.txt")]),
+            "no content means nothing to write"
+        )
+    }
+
+    #if os(macOS) || os(Linux)
+        func testWriteFileTreatsContentAsLiteralData() throws {
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let target = directory.appendingPathComponent("it's a file")
+            let marker = directory.appendingPathComponent("unexpected")
+            let payloads = ["", "no trailing newline", "trailing newline\n", "single ' quote",
+                            "GLAZEVERRE_EOF\ntouch '\(marker.path)'\nGLAZEVERRE_EOF",
+                            "$(touch '\(marker.path)') `touch '\(marker.path)'`", "中文\n百分号 %s"]
+            for content in payloads {
+                let command = try XCTUnwrap(AgentToolRegistry.shellCommand(
+                    for: "write_file", arguments: ["path": .string(target.path), "content": .string(content)]
+                ))
+                let process = Process()
+                process.executableURL = URL(fileURLWithPath: "/bin/sh")
+                process.arguments = ["-c", command]
+                try process.run()
+                process.waitUntilExit()
+                XCTAssertEqual(process.terminationStatus, 0)
+                XCTAssertEqual(try Data(contentsOf: target), Data(content.utf8))
+                XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path))
+            }
+        }
+    #endif
+
+    func testShellCommandQuotesHostilePaths() {
+        let rendered = AgentToolRegistry.shellCommand(for: "read_file", arguments: ["path": .string("/tmp/it's; rm -rf /")])
+        XCTAssertEqual(rendered, #"cat -- '/tmp/it'\''s; rm -rf /'"#)
+    }
+
+    func testShellCommandIsNilForAppManagedTools() {
+        XCTAssertNil(AgentToolRegistry.shellCommand(for: "run_snippet", arguments: ["name": .string("backup")]))
+        XCTAssertNil(AgentToolRegistry.shellCommand(for: "create_snippet", arguments: [:]))
+        XCTAssertNil(AgentToolRegistry.shellCommand(for: "run_command", arguments: [:]))
+    }
+
+    func testHostToolsExposeAHostArgument() {
+        let hostAware = ["run_command", "read_file", "write_file", "list_dir", "get_system_info"]
+        for name in hostAware {
+            let tool = AgentToolRegistry.defaultToolDefinitions.first { $0.name == name }
+            let properties = extractObject(tool?.parameters)?["properties"]
+            XCTAssertNotNil(extractObject(properties)?["host"], "\(name) should let the model name a target server")
+        }
+    }
+
+    func testSystemPromptListsConfiguredServers() {
+        let prompt = AgentContextBuilder.systemPrompt(
+            tools: AgentToolRegistry.defaultToolDefinitions,
+            context: AgentContext(
+                userPrompt: "status",
+                host: HostSummary(alias: "web-1", workingPaths: []),
+                availableHosts: ["web-1", "db-1"]
+            ),
+            approvedWorkingDir: nil
+        )
+        XCTAssertTrue(prompt.contains("- web-1"))
+        XCTAssertTrue(prompt.contains("- db-1"), "the assistant must see the whole server list")
+        XCTAssertTrue(prompt.contains("do NOT call a tool"), "plain questions should not force a tool call")
+    }
 }

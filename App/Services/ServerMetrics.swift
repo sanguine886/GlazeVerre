@@ -67,8 +67,11 @@ struct ServerMetricSampler {
         let (rxDelta, txDelta): (UInt64, UInt64)
         if let lastRx = lastNetRx, let lastTx = lastNetTx, let lastNanos = lastSampleNanos, now > lastNanos {
             let elapsed = Double(now - lastNanos) / 1_000_000_000
-            rxDelta = elapsed > 0.001 ? UInt64(Double(rx - lastRx) / elapsed) : 0
-            txDelta = elapsed > 0.001 ? UInt64(Double(tx - lastTx) / elapsed) : 0
+            // Counters only ever grow — except across a reboot, an `ifdown`, or a
+            // different interface winning the scan. Subtracting UInt64 the other
+            // way round traps, so a decrease reads as "no traffic this tick".
+            rxDelta = Self.rate(from: lastRx, to: rx, elapsed: elapsed)
+            txDelta = Self.rate(from: lastTx, to: tx, elapsed: elapsed)
         } else {
             rxDelta = 0
             txDelta = 0
@@ -91,6 +94,13 @@ struct ServerMetricSampler {
 
     // MARK: - Parsing helpers (POSIX-ish output)
 
+    /// Bytes-per-second between two cumulative counter readings. A counter that
+    /// went backwards (reboot / interface reset) yields 0 instead of trapping.
+    static func rate(from previous: UInt64, to current: UInt64, elapsed: Double) -> UInt64 {
+        guard elapsed > 0.001, current >= previous else { return 0 }
+        return UInt64(Double(current - previous) / elapsed)
+    }
+
     /// Finds the first decimal number after `marker` in `text`.
     static func firstNumber(after marker: String, in text: String) -> Double? {
         guard let range = text.range(of: marker) else { return nil }
@@ -112,18 +122,26 @@ struct ServerMetricSampler {
         return tokens[index]
     }
 
-    /// From `/proc/net/dev` extracts the `eth`/`en` interface rx/tx byte totals.
+    /// From `/proc/net/dev` extracts a real interface's rx/tx byte totals.
+    /// Loopback is skipped (its traffic is not "network status"); the first
+    /// non-`lo` device wins, and a short line is skipped rather than crashing.
     /// Defensively bounds-checked: a device line must carry at least 10
     /// whitespace tokens (index 9 = tx; shorter lines are skipped, never crash).
     static func ethBytes(in text: String) -> (rx: UInt64, tx: UInt64) {
+        var loopback: (rx: UInt64, tx: UInt64)?
         for line in text.split(separator: "\n") where line.contains(":") {
             let cleaned = line.split(whereSeparator: \.isWhitespace)
             // [0]=iface, [1]=rxBytes, …, [9]=txBytes. Require the full column.
             guard cleaned.count > 9 else { continue }
             let rx = UInt64(cleaned[1].trimmingCharacters(in: .init(charactersIn: ":"))) ?? 0
             let tx = UInt64(cleaned[9]) ?? 0
+            let name = cleaned[0].trimmingCharacters(in: .init(charactersIn: ":"))
+            if name == "lo" {
+                loopback = (rx, tx)
+                continue
+            }
             return (rx, tx)
         }
-        return (0, 0)
+        return loopback ?? (0, 0)
     }
 }
