@@ -197,7 +197,7 @@ public actor SSHSession {
         setState(.reconnecting(attempt: 0))
         reconnectTask = Task { [weak self] in
             guard let self else { return }
-            await self.reconnectLoop(attempt: attempt)
+            await reconnectLoop(attempt: attempt)
         }
     }
 

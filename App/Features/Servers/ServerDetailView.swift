@@ -150,8 +150,7 @@ struct ServerDetailView: View {
     private func openAndCollect() async {
         // Show the last known state immediately; the live loop extends it.
         metrics = ServerMetricsCache.shared.history(for: record.id)
-        guard session == nil else { return }
-        guard !isCollecting else { return }
+        guard session == nil, !isCollecting else { return }
         let (freshSession, config): (SSHSession, SSHHostConfig)
         do {
             (freshSession, config) = try manager.openSession(for: record)

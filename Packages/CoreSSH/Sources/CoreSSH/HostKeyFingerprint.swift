@@ -59,10 +59,10 @@ public struct HostKeyFingerprint: Equatable, Hashable, Codable, Sendable {
     /// pinned by HostKeyFingerprintTests against real fingerprints.
     static func extractPayload(from key: NIOSSHPublicKey) -> KeyPayload? {
         let keyMirror = Mirror(reflecting: key)
-        guard let backing = keyMirror.children.first(where: { $0.label == "backingKey" })?.value else {
-            return nil
-        }
-        guard let payload = Mirror(reflecting: backing).children.first, let caseName = payload.label else {
+        guard let backing = keyMirror.children.first(where: { $0.label == "backingKey" })?.value,
+              let payload = Mirror(reflecting: backing).children.first,
+              let caseName = payload.label
+        else {
             return nil
         }
 

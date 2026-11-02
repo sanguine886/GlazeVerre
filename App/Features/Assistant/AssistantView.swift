@@ -275,8 +275,7 @@ struct AssistantView: View {
 
     private func send() {
         let prompt = draft.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !prompt.isEmpty else { return }
-        guard let config = providers.activeProviderConfig else { return }
+        guard !prompt.isEmpty, let config = providers.activeProviderConfig else { return }
         draft = ""
         Task {
             _ = await chat.send(

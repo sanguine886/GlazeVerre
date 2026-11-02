@@ -88,10 +88,7 @@ public enum ReadOnlyCommandPolicy {
     /// Whether `command` may be auto-approved in read-only mode.
     public static func allows(_ command: String) -> Bool {
         let parsed = ShellCommandParser.parse(command)
-        guard !parsed.unsafeSyntax, let name = parsed.words.first else {
-            return false
-        }
-        guard let entry = entries[name] else {
+        guard !parsed.unsafeSyntax, let name = parsed.words.first, let entry = entries[name] else {
             return false
         }
 
