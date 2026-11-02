@@ -122,9 +122,7 @@ public final class CitadelTransport: SSHTransport, @unchecked Sendable {
                     continuation.finish()
                 }
             } catch {
-                if opened.settleIfFirst {
-                    opened.fail(error)
-                }
+                opened.fail(error)
                 continuation.yield(.exited)
                 continuation.finish()
             }
@@ -224,57 +222,6 @@ final class TTYWriterBox: @unchecked Sendable {
         lock.withLock {
             writer
         }
-    }
-}
-
-/// One-shot continuation gate signaled once the shell channel is live.
-final class OpenSignal: @unchecked Sendable {
-    private let lock = NIOLock()
-    private var continuation: CheckedContinuation<Void, Error>?
-    private var settled = false
-
-    /// Resumes (and consumes) any pending waiter; safe to call multiple times.
-    var settleIfFirst: Bool {
-        lock.withLock {
-            let first = !settled
-            if first {
-                settled = true
-            }
-            return first
-        }
-    }
-
-    func wait() async throws {
-        try await withCheckedThrowingContinuation { continuation in
-            lock.withLock {
-                if settled {
-                    self.continuation = nil
-                    continuation.resume()
-                } else {
-                    self.continuation = continuation
-                }
-            }
-        }
-    }
-
-    func succeed() {
-        let pending = lock.withLock { () -> CheckedContinuation<Void, Error>? in
-            let pending = continuation
-            continuation = nil
-            settled = true
-            return pending
-        }
-        pending?.resume()
-    }
-
-    func fail(_ error: Error) {
-        let pending = lock.withLock { () -> CheckedContinuation<Void, Error>? in
-            let pending = continuation
-            continuation = nil
-            settled = true
-            return pending
-        }
-        pending?.resume(throwing: error)
     }
 }
 

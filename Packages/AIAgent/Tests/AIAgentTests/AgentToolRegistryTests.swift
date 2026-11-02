@@ -102,17 +102,43 @@ final class AgentToolRegistryTests: XCTestCase {
         )
     }
 
-    func testShellCommandWriteFileUsesHeredoc() {
+    func testShellCommandWriteFilePreservesContent() {
         let rendered = AgentToolRegistry.shellCommand(
             for: "write_file",
             arguments: ["path": .string("/tmp/a.txt"), "content": .string("line1\nline2")]
         )
-        XCTAssertEqual(rendered, "cat > '/tmp/a.txt' <<'GLAZEVERRE_EOF'\nline1\nline2\nGLAZEVERRE_EOF")
+        XCTAssertEqual(rendered, "printf '%s' 'line1\nline2' > '/tmp/a.txt'")
         XCTAssertNil(
             AgentToolRegistry.shellCommand(for: "write_file", arguments: ["path": .string("/tmp/a.txt")]),
             "no content means nothing to write"
         )
     }
+
+    #if os(macOS) || os(Linux)
+        func testWriteFileTreatsContentAsLiteralData() throws {
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let target = directory.appendingPathComponent("it's a file")
+            let marker = directory.appendingPathComponent("unexpected")
+            let payloads = ["", "no trailing newline", "trailing newline\n", "single ' quote",
+                            "GLAZEVERRE_EOF\ntouch '\(marker.path)'\nGLAZEVERRE_EOF",
+                            "$(touch '\(marker.path)') `touch '\(marker.path)'`", "中文\n百分号 %s"]
+            for content in payloads {
+                let command = try XCTUnwrap(AgentToolRegistry.shellCommand(
+                    for: "write_file", arguments: ["path": .string(target.path), "content": .string(content)]
+                ))
+                let process = Process()
+                process.executableURL = URL(fileURLWithPath: "/bin/sh")
+                process.arguments = ["-c", command]
+                try process.run()
+                process.waitUntilExit()
+                XCTAssertEqual(process.terminationStatus, 0)
+                XCTAssertEqual(try Data(contentsOf: target), Data(content.utf8))
+                XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path))
+            }
+        }
+    #endif
 
     func testShellCommandQuotesHostilePaths() {
         let rendered = AgentToolRegistry.shellCommand(for: "read_file", arguments: ["path": .string("/tmp/it's; rm -rf /")])

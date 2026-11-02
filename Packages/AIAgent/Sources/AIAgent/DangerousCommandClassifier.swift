@@ -27,11 +27,9 @@ public struct DangerRule: Sendable, Equatable {
 
 /// CommandClassification — the verdict for a single command string.
 ///
-/// A matched rule, when present, is the first rule in `ruleSet` whose pattern
-/// matched; the verdict is `dangerous`/`critical` to mirror that rule's
-/// severity. Classification is first-match-in-order, so rule ordering is
-/// significant — list the more specific (critical) rules first when they
-/// must take precedence over a broader `dangerous` rule.
+/// A matched rule, when present, is the most severe rule whose pattern
+/// matched: when several rules fire, the highest risk level wins, so a broad
+/// `dangerous` rule can never mask a `critical` one that also matched.
 public struct CommandClassification: Sendable, Equatable {
     public enum Verdict: Sendable, Equatable {
         case safe
@@ -51,67 +49,14 @@ public struct CommandClassification: Sendable, Equatable {
 /// DangerousCommandClassifier — pure, stateless classifier over the curated
 /// rule set.
 ///
-/// Lookup is first-match-in-order. Patterns are compiled once per rule on
-/// first use and cached, since `NSRegularExpression` is thread-safe after the
-/// pattern has been compiled.
+/// Every rule is evaluated and the most severe match wins, so a `critical`
+/// rule is never masked by a broader `dangerous` rule that also fired.
+/// Patterns are compiled once per rule on first use and cached, since
+/// `NSRegularExpression` is thread-safe after the pattern has been compiled.
 public struct DangerousCommandClassifier: Sendable {
     /// Empty initializer so other modules can spin up a default instance
     /// (e.g. from a public default-argument value in ApprovalPolicy).
     public init() {}
-
-    /// Read-only command prefixes. A command starting with any of these
-    /// (case-insensitively) is treated as read-only for approval policy.
-    public static let readOnlyCommandPrefixes: [String] = [
-        "ls",
-        "cat",
-        "head",
-        "tail",
-        "df",
-        "free",
-        "ps",
-        "pwd",
-        "date",
-        "uptime",
-        "uname",
-        "whoami",
-        "id",
-        "groups",
-        "env",
-        "echo",
-        "hostname",
-        "which",
-        "type",
-        "command",
-        "man",
-        "less",
-        "more",
-        "grep",
-        "awk",
-        "sed -n",
-        "sort",
-        "uniq",
-        "wc",
-        "du",
-        "stat",
-        "file",
-        "find",
-        "tree",
-        "dig",
-        "nslookup",
-        "ping",
-        "route",
-        "arp",
-        "netstat",
-        "ss",
-        "curl -I",
-        "wget --spider",
-        "getent",
-        "sysctl -a",
-        "uptime",
-        "vmstat",
-        "iostat",
-        "sar",
-    ]
 
     public static let ruleSet: [DangerRule] = [
         DangerRule(id: "rm-recursive-force", pattern: #"rm\s+(-{1,2}[a-z]*)?r[a-z]*f\b"#, severity: .dangerous, summary: "Any rm -rf recursive force delete"),
@@ -199,26 +144,31 @@ public struct DangerousCommandClassifier: Sendable {
         DangerRule(id: "overwrite-var-log", pattern: #"\becho\s+.*>\s*/var/log"#, severity: .dangerous, summary: "Overwrite log files"),
     ]
 
-    /// Classify a command by first-match over `ruleSet`.
+    /// Classify a command by the most severe matching rule.
     ///
-    /// The command is trimmed of surrounding whitespace before matching. The
-    /// verdict mirrors the severity of the first matching rule.
+    /// The command is trimmed of surrounding whitespace before matching. Every
+    /// rule is evaluated; the rule with the highest severity wins, and among
+    /// rules of equal severity the earliest one in `ruleSet` is reported.
     public func classify(_ command: String) -> CommandClassification {
         let trimmed = command.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else {
             return CommandClassification(verdict: .safe, matchedRule: nil)
         }
+        var best: (rule: DangerRule, severity: DangerRule.Severity)?
         for rule in Self.ruleSet {
             let range = NSRange(location: 0, length: trimmed.utf16.count)
             guard Self.regex(for: rule.id, pattern: rule.pattern)?.firstMatch(in: trimmed, options: [], range: range) != nil else {
                 continue
             }
-            if rule.severity == .critical {
-                return CommandClassification(verdict: .critical, matchedRule: rule)
+            if best == nil || (rule.severity == .critical && best?.severity == .dangerous) {
+                best = (rule, rule.severity)
             }
-            return CommandClassification(verdict: .dangerous, matchedRule: rule)
         }
-        return CommandClassification(verdict: .safe, matchedRule: nil)
+        guard let best else {
+            return CommandClassification(verdict: .safe, matchedRule: nil)
+        }
+        let verdict: CommandClassification.Verdict = best.severity == .critical ? .critical : .dangerous
+        return CommandClassification(verdict: verdict, matchedRule: best.rule)
     }
 
     /// Leading command token (first whitespace-separated run), capped at four
@@ -234,15 +184,14 @@ public struct DangerousCommandClassifier: Sendable {
         return String(first.prefix(min(4, first.count)))
     }
 
-    /// Returns true when the command starts with any read-only prefix.
+    /// Returns true when the command is a single, provably read-only command.
+    ///
+    /// The command is parsed like a shell would: redirections, pipes,
+    /// command substitution and separators disqualify it, and the command name
+    /// must appear in the read-only allow-list with options that can neither
+    /// write files nor execute other programs.
     public func isReadOnlyWhitelisted(_ command: String) -> Bool {
-        let trimmed = command.trimmingCharacters(in: .whitespacesAndNewlines)
-        let prefix = Self.readOnlyCommandPrefixes.joined(separator: "|")
-        let anchored = "^(?:\(prefix))"
-        guard let regex = Self.regex(for: "readOnlyAnchored", pattern: anchored, options: [.caseInsensitive, .anchorsMatchLines]) else {
-            return false
-        }
-        return regex.firstMatch(in: trimmed, options: [], range: NSRange(location: 0, length: trimmed.utf16.count)) != nil
+        ReadOnlyCommandPolicy.allows(command)
     }
 
     // MARK: - Pattern cache

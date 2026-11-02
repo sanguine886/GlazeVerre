@@ -35,19 +35,23 @@ final class OpenSignalTests: XCTestCase {
         }
     }
 
-    func testSettleIfFirstOnlyOnce() {
+    func testFirstSuccessWins() async throws {
         let signal = OpenSignal()
-        XCTAssertTrue(signal.settleIfFirst)
-        XCTAssertFalse(signal.settleIfFirst)
-        // Even a resolved signal reports as already settled.
         signal.succeed()
-        XCTAssertFalse(signal.settleIfFirst)
+        signal.fail(SSHError.connectionLost)
+        try await signal.wait()
     }
 
-    func testWaitAfterFailReturnsImmediately() async {
+    func testFirstFailureReachesLateWaiter() async {
         let signal = OpenSignal()
         signal.fail(SSHError.connectionFailed("boom"))
-        try? await signal.wait() // already settled; the error went to the earlier waiter
+        signal.succeed()
+        do {
+            try await signal.wait()
+            XCTFail("Expected stored failure")
+        } catch {
+            XCTAssertEqual(error as? SSHError, .connectionFailed("boom"))
+        }
     }
 
     func testCallbackBoxSetGet() {

@@ -202,9 +202,10 @@ public struct AgentToolRegistry: Sendable {
     /// text, so what a human approves is what runs.
     ///
     /// Returns nil for app-managed tools (snippets) that never touch the shell.
-    /// `write_file` uses a quoted heredoc; a payload containing the delimiter
-    /// line itself would break it (ponytail: fine until someone writes shell
-    /// scripts about GLAZEVERRE_EOF, then switch to base64 + `base64 -d`).
+    /// `write_file` passes its payload as DATA (`printf '%s' '<content>'`),
+    /// never as shell source: a heredoc would let a payload that contains the
+    /// delimiter line run as commands, and `printf` with a quoted argument
+    /// keeps the bytes exactly as the model wrote them.
     public static func shellCommand(for name: String, arguments: [String: JSONValue]) -> String? {
         let path = arguments["path"]?.stringValue
         switch name {
@@ -218,7 +219,7 @@ public struct AgentToolRegistry: Sendable {
             guard let path, let content = arguments["content"]?.stringValue else {
                 return nil
             }
-            return "cat > \(singleQuoted(path)) <<'GLAZEVERRE_EOF'\n\(content)\nGLAZEVERRE_EOF"
+            return "printf '%s' \(singleQuoted(content)) > \(singleQuoted(path))"
         case "get_system_info":
             return "uname -a; uptime; free -h; df -h /"
         default:

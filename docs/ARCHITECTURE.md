@@ -80,3 +80,5 @@ CI（`.github/workflows/ci.yml`）在 `macos-26`（Xcode 26，iOS 26 SDK）上�
 | ADR-0008 | 主机密钥指纹：swift-nio-ssh 不公开 key 序列化，指纹经 Mirror 读取 `NIOSSHPublicKey` 内部 backing 提取原始密钥再按 RFC 4253 wire 格式哈希；以真实 `ssh-keygen` 指纹作 Guard 测试钉死内部布局，上游变更时 CI 立即失败并按新布局修复 |
 | ADR-0009 | SSH keepalive 以周期性 `true` exec 通道实现（Citadel 0.12 无协议级 keepalive 配置），默认 15s 可配 |
 | ADR-0010 | 客户端私钥导入 P1 支持 OpenSSH-ED25519 与 RSA（含口令解密）；ECDSA-P256 客户端密钥解析随 P3 补齐——主机侧 ECDSA-P256/384/521 指纹校验 P1 已支持 |
+| ADR-0011 | SSH 连接生命周期以代际标识隔离异步握手、重连与断线回调；断开取消重连，过期连接必须关闭。Shell 打开信号原子保存首个成功或失败结果，避免等待顺序改变错误传播。 |
+| ADR-0012 | 只读白名单改为「完整命令名 + 选项级准入」的本地解析：重定向、命令替换、管道、分号一律不放行，精确命令名匹配避免 `lsanything` 之类前缀误判；分类器改为多条规则命中取最高风险等级，避免宽泛 dangerous 规则掩盖 critical；`write_file` 以 `printf '%s' '<内容>'` 传数据，heredoc 分隔符可被内容伪造故弃用 |

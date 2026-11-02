@@ -4,6 +4,25 @@ import XCTest
 final class DangerousCommandClassifierTests: XCTestCase {
     private let classifier = DangerousCommandClassifier()
 
+    /// Commands that look read-only by name but are not: shell syntax that
+    /// chains or substitutes, a program launcher, or an option that writes.
+    private static let rejectedByReadOnlyPolicy = [
+        "lsanything",
+        "ls; touch /tmp/x",
+        "ls\ntouch /tmp/x",
+        "echo $(touch /tmp/x)",
+        "echo `touch /tmp/x`",
+        "env sh",
+        "find . -exec touch /tmp/x \\;",
+        "awk 'BEGIN {system(\"touch /tmp/x\")}'",
+        "sort -o /tmp/x /tmp/input",
+        "date -s tomorrow",
+        "hostname new-name",
+        "ls | sh",
+        "cat < /etc/hosts",
+        "LS",
+    ]
+
     func testRuleSetHasAtLeast40Rules() {
         XCTAssertGreaterThanOrEqual(DangerousCommandClassifier.ruleSet.count, 40)
     }
@@ -52,7 +71,25 @@ final class DangerousCommandClassifierTests: XCTestCase {
         XCTAssertTrue(classifier.isReadOnlyWhitelisted("ls -la"))
         XCTAssertTrue(classifier.isReadOnlyWhitelisted("cat /etc/passwd"))
         XCTAssertFalse(classifier.isReadOnlyWhitelisted("rm -rf x"))
-        XCTAssertTrue(classifier.isReadOnlyWhitelisted("echo hi > /tmp")) // echo is whitelisted as a prefix
+        XCTAssertFalse(classifier.isReadOnlyWhitelisted("echo hi > /tmp"))
+    }
+
+    func testReadOnlyWhitelistRejectsShellAndExecutableOptions() {
+        for command in Self.rejectedByReadOnlyPolicy {
+            XCTAssertFalse(classifier.isReadOnlyWhitelisted(command), command)
+        }
+    }
+
+    func testReadOnlyWhitelistAcceptsLiteralQuotedPaths() {
+        for path in ["/tmp/a b", "/tmp/it's", "/tmp/$(touch x)", "/tmp/a;b"] {
+            let command = AgentToolRegistry.shellCommand(for: "read_file", arguments: ["path": .string(path)])
+            XCTAssertTrue(classifier.isReadOnlyWhitelisted(command ?? ""), path)
+        }
+    }
+
+    func testHighestSeverityWinsAcrossMatchingRules() {
+        XCTAssertEqual(classifier.classify("rm -rf / --no-preserve-root").verdict, .critical)
+        XCTAssertEqual(classifier.classify("rm -rf /tmp/cache; shutdown now").verdict, .critical)
     }
 
     func testForkBombClassifiedCritical() {
